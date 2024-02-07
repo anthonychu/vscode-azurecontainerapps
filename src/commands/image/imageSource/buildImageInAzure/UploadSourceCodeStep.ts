@@ -5,6 +5,8 @@
 
 import { getResourceGroupFromId } from '@microsoft/vscode-azext-azureutils';
 import { AzExtFsExtra, GenericParentTreeItem, GenericTreeItem, activityFailContext, activityFailIcon, activitySuccessContext, activitySuccessIcon, nonNullValue } from '@microsoft/vscode-azext-utils';
+import { randomUUID } from 'crypto';
+import { tmpdir } from 'os';
 import * as path from 'path';
 import * as tar from 'tar';
 import { type Progress } from 'vscode';
@@ -33,9 +35,29 @@ export class UploadSourceCodeStep extends ExecuteActivityOutputStepBase<BuildIma
 
         const source: string = path.join(context.rootFolder.uri.fsPath, this._sourceFilePath);
         let items = await AzExtFsExtra.readDirectory(source);
-        items = items.filter(i => !vcsIgnoreList.includes(i.name));
+        items = items.filter(i => !vcsIgnoreList.includes(i.name) && i.fsPath !== context.dockerfilePath);
 
-        await tar.c({ cwd: source, gzip: true, file: context.tarFilePath }, items.map(i => path.relative(source, i.fsPath)));
+        // Create an uncompressed tarball first, because we need to add the Dockerfile to it
+        const tarFilePath = context.tarFilePath.replace(/\.tar\.gz$/, '.tar');
+        await tar.c({ cwd: source, file: tarFilePath }, items.map(i => path.relative(source, i.fsPath)));
+
+        const tempDockerfileDir = path.join(tmpdir(), randomUUID());
+        const dockerfileRelativePath = path.relative(context.rootFolder.uri.fsPath, context.dockerfilePath);
+        const tempDockerfilePath = path.join(tempDockerfileDir, dockerfileRelativePath);
+        await AzExtFsExtra.copy(context.dockerfilePath, tempDockerfilePath);
+
+        const platformRegex = /^(FROM.*)\s--platform=\S+(.*)$/gm;
+        let dockerfileContent = await AzExtFsExtra.readFile(tempDockerfilePath);
+        if (platformRegex.test(dockerfileContent)) {
+            dockerfileContent = dockerfileContent.replace(platformRegex, '$1$2');
+            progress.report({ message: localize('removedPlatformFlag', 'Removed --platform flag from Dockerfile...') });
+        }
+        await AzExtFsExtra.writeFile(tempDockerfilePath, dockerfileContent);
+        await tar.r({ cwd: tempDockerfileDir, file: tarFilePath }, [dockerfileRelativePath]);
+
+        // Compress the tarball and delete the uncompressed tarball
+        await tar.c({ gzip: true, file: context.tarFilePath }, [`@${tarFilePath}`]);
+        await AzExtFsExtra.deleteResource(tarFilePath);
 
         const sourceUploadLocation = await context.client.registries.getBuildSourceUploadUrl(context.resourceGroupName, context.registryName);
         const uploadUrl: string = nonNullValue(sourceUploadLocation.uploadUrl);
